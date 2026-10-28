@@ -1,0 +1,17 @@
+Import('AIC_ROOT')
+from building import *
+
+cwd = GetCurrentDir()
+cherryusb = AIC_ROOT + '/packages/third-party/cherryusb'
+
+src = Glob('main.c') + Glob('usbd_winusb_display.c')
+path = [cwd, cherryusb + '/core',
+        AIC_ROOT + '/packages/artinchip/mpp/include',
+        AIC_ROOT + '/bsp/artinchip/include/uapi']
+defines = ['LPKG_CHERRYUSB_WINUSB_DISPLAY_H264']
+if GetDepend('LPKG_CHERRYUSB_DEVICE_HS'):
+    defines += ['CONFIG_USB_HS']
+
+group = DefineGroup('Applications', src, depend=[''],
+                    CPPPATH=path, CPPDEFINES=defines)
+Return('group')

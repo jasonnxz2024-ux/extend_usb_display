@@ -1,0 +1,774 @@
+diff --git a/win10_idd_xfz1986_usb_graphic_driver/idd_xfz1986_usb_graphic/Driver.cpp b/win10_idd_xfz1986_usb_graphic_driver/idd_xfz1986_usb_graphic/Driver.cpp
+old mode 100755
+new mode 100644
+index 5e6bf01..249344b
+--- a/win10_idd_xfz1986_usb_graphic_driver/idd_xfz1986_usb_graphic/Driver.cpp
++++ b/win10_idd_xfz1986_usb_graphic_driver/idd_xfz1986_usb_graphic/Driver.cpp
+@@ -198,7 +198,7 @@ extern "C" NTSTATUS DriverEntry(
+ 
+     //WPP_INIT_TRACING(pDriverObject, pRegistryPath);
+ 	registry_config_base();
+-    LOGI("idd Driver xfz1986 v2.0  build 20240801\n",);
++    LOGI("idd Driver xfz1986 H264 v1.3.0.0\n",);
+ 
+     WDF_DRIVER_CONFIG_INIT(&Config,
+ 
+@@ -213,7 +213,8 @@ extern "C" NTSTATUS DriverEntry(
+     return Status;
+ }
+ 
+-#include "ioctl.h"
++#include "ioctl.h"
++#include "enc_h264.h"
+ 
+ 
+ 
+@@ -502,7 +503,7 @@ DWORD CALLBACK SwapChainProcessor::RunThread(LPVOID Argument)
+ }
+ 
+ void test_usb_dev_info(void);
+-void SwapChainProcessor::Run()
++void SwapChainProcessor::Run()
+ {
+     // For improved performance, make use of the Multimedia Class Scheduler Service, which will intelligently
+     // prioritize this thread for improved throughput in high CPU-load scenarios.
+@@ -512,8 +513,10 @@ void SwapChainProcessor::Run()
+ 	auto* pDeviceContext = WdfObjectGet_IndirectDeviceContextWrapper(mp_WdfDevice);
+     HANDLE AvTaskHandle = AvSetMmThreadCharacteristicsW(L"Distribution", &AvTask);
+     
+-	decision_runtime_encoder(mp_WdfDevice);
+-    RunCore();
++	decision_runtime_encoder(mp_WdfDevice);
++    RunCore();
++	delete encoder;
++	encoder = nullptr;
+ 
+     // Always delete the swap-chain object when swap-chain processing loop terminates in order to kick the system to
+     // provide a new swap-chain if necessary.
+@@ -650,7 +653,11 @@ void SwapChainProcessor::RunCore()
+ 						int total_bytes = encoder->enc(&purb->urb_msg[sizeof(udisp_frame_header_t)],this->fb_buf,0, 0, frameDescriptor.Width-1, frameDescriptor.Height-1, frameDescriptor.Width,pContext->blimit);
+ 						c=get_system_us();		
+ 
+-						encoder->enc_header(purb->urb_msg,0,0, frameDescriptor.Width - 1, frameDescriptor.Height - 1, total_bytes);
++						if(total_bytes <= 0) {
++							InterlockedPushEntrySList(&urb_list, &(purb->node));
++							goto next;
++						}
++						encoder->enc_header(purb->urb_msg,0,0, frameDescriptor.Width - 1, frameDescriptor.Height - 1, total_bytes);
+ 						total_bytes+=sizeof(udisp_frame_header_t);
+ 
+ 						#if 1
+@@ -1308,10 +1315,18 @@ int enc_cfged=0;
+ 		    }
+ 			//*fps=60;
+ 			break;
+-		case 'E':
++		case 'E':
+ 			if(enc_cfged) //first is high prio
+ 				break;
+-			switch(str[1]){
++			switch(str[1]){
++			case 'h':
++				t=sscanf(str,"Eh264%d",quality);
++				if(t==1){
++					*enc=UDISP_TYPE_H264;
++					enc_cfged++;
++					LOGI("enc:H264 bitrate:%d Mbps\n",*quality);
++				}
++				break;
+ 			case 'j':
+ 				t=sscanf(str,"Ejpg%d",quality);
+ 				if(t==1){
+@@ -1369,9 +1384,13 @@ void SwapChainProcessor::decision_runtime_encoder(WDFDEVICE Device){
+ 	case UDISP_TYPE_RGB888:
+ 		this->encoder = new enc_rgb888a();
+ 		break;
+-	case UDISP_TYPE_JPG:
+-		this->encoder = new enc_jpg(pDeviceContext->quality);
+-		break;
++	case UDISP_TYPE_JPG:
++		this->encoder = new enc_jpg(pDeviceContext->quality);
++		break;
++	case UDISP_TYPE_H264:
++		this->encoder = new enc_h264(pDeviceContext->quality,
++			pDeviceContext->fps);
++		break;
+     default:
+ 		this->encoder = new enc_jpg(4);
+ 		break;
+diff --git a/win10_idd_xfz1986_usb_graphic_driver/idd_xfz1986_usb_graphic/Driver.h b/win10_idd_xfz1986_usb_graphic_driver/idd_xfz1986_usb_graphic/Driver.h
+old mode 100755
+new mode 100644
+index 37d9044..2409728
+--- a/win10_idd_xfz1986_usb_graphic_driver/idd_xfz1986_usb_graphic/Driver.h
++++ b/win10_idd_xfz1986_usb_graphic_driver/idd_xfz1986_usb_graphic/Driver.h
+@@ -3,7 +3,6 @@
+ #define NOMINMAX
+ #include <windows.h>
+ #include <bugcodes.h>
+-#include <wudfwdm.h>
+ #include <wdf.h>
+ #include <iddcx.h>
+ 
+@@ -172,4 +171,3 @@ public:
+ };
+ }
+ }
+-
+diff --git a/win10_idd_xfz1986_usb_graphic_driver/idd_xfz1986_usb_graphic/enc_base.h b/win10_idd_xfz1986_usb_graphic_driver/idd_xfz1986_usb_graphic/enc_base.h
+old mode 100755
+new mode 100644
+index 7508873..90eea28
+--- a/win10_idd_xfz1986_usb_graphic_driver/idd_xfz1986_usb_graphic/enc_base.h
++++ b/win10_idd_xfz1986_usb_graphic_driver/idd_xfz1986_usb_graphic/enc_base.h
+@@ -26,7 +26,8 @@ PACK(
+ #define UDISP_TYPE_RGB565  0
+ #define UDISP_TYPE_RGB888  1
+ #define UDISP_TYPE_YUV420  2
+-#define UDISP_TYPE_JPG		3
++#define UDISP_TYPE_JPG		3
++#define UDISP_TYPE_H264		4
+ 
+ 
+ typedef struct _udisp_frame_header_t {  //16bytes
+@@ -44,7 +45,8 @@ typedef struct _udisp_frame_header_t {  //16bytes
+ 
+ class enc_base{
+ 	
+-public:
++public:
++	virtual ~enc_base() = default;
+ 
+ 	static int disp_setup_frame_header(uint8_t * msg, int x, int y, int right, int bottom, uint8_t op_flg ,uint32_t total);
+ 	int enc_header(uint8_t * enc,int x, int y, int right, int bottom, int total_bytes){
+@@ -52,7 +54,7 @@ public:
+ 		disp_setup_frame_header(enc, x, y, right, bottom, this->enc_type, total_bytes);
+ 		return 0;
+ 		};
+-	virtual int enc( uint8_t * enc, uint8_t * src,int x, int y, int right, int bottom, int line_width,int limit)=0;
++	virtual int enc( uint8_t * enc, uint8_t * src,int x, int y, int right, int bottom, int line_width,int limit)=0;
+ 
+ protected :
+ 		uint8_t enc_type;
+diff --git a/win10_idd_xfz1986_usb_graphic_driver/idd_xfz1986_usb_graphic/enc_h264.cpp b/win10_idd_xfz1986_usb_graphic_driver/idd_xfz1986_usb_graphic/enc_h264.cpp
+new file mode 100644
+index 0000000..49af5ee
+--- /dev/null
++++ b/win10_idd_xfz1986_usb_graphic_driver/idd_xfz1986_usb_graphic/enc_h264.cpp
+@@ -0,0 +1,409 @@
++#include "enc_h264.h"
++#include "log.h"
++
++#define NOMINMAX
++#include <windows.h>
++#include <codecapi.h>
++#include <mfapi.h>
++#include <mferror.h>
++#include <mfidl.h>
++#include <mftransform.h>
++#include <wmcodecdsp.h>
++#include <wrl/client.h>
++
++#include <algorithm>
++#include <vector>
++
++using Microsoft::WRL::ComPtr;
++
++namespace {
++
++uint8_t clamp_byte(int value)
++{
++    return static_cast<uint8_t>(std::max(0, std::min(255, value)));
++}
++
++bool has_start_code(const uint8_t* data, size_t size)
++{
++    return size >= 4 && data[0] == 0 && data[1] == 0 &&
++           (data[2] == 1 || (data[2] == 0 && data[3] == 1));
++}
++
++void append_start_code_nal(std::vector<uint8_t>& output,
++                           const uint8_t* nal, size_t size)
++{
++    static const uint8_t start_code[] = {0, 0, 0, 1};
++    output.insert(output.end(), start_code, start_code + sizeof(start_code));
++    output.insert(output.end(), nal, nal + size);
++}
++
++bool avcc_to_annex_b(const uint8_t* data, size_t size,
++                     std::vector<uint8_t>& output)
++{
++    size_t offset = 0;
++    output.clear();
++    while (offset + 4 <= size) {
++        uint32_t nal_size = (static_cast<uint32_t>(data[offset]) << 24) |
++                            (static_cast<uint32_t>(data[offset + 1]) << 16) |
++                            (static_cast<uint32_t>(data[offset + 2]) << 8) |
++                            data[offset + 3];
++        offset += 4;
++        if (!nal_size || offset + nal_size > size) {
++            output.clear();
++            return false;
++        }
++        append_start_code_nal(output, data + offset, nal_size);
++        offset += nal_size;
++    }
++    return offset == size && !output.empty();
++}
++
++bool decoder_config_to_annex_b(const uint8_t* data, size_t size,
++                               std::vector<uint8_t>& output)
++{
++    output.clear();
++    if (has_start_code(data, size)) {
++        output.assign(data, data + size);
++        return true;
++    }
++    if (size < 7 || data[0] != 1)
++        return false;
++
++    size_t offset = 5;
++    unsigned int sps_count = data[offset++] & 0x1f;
++    for (unsigned int i = 0; i < sps_count; ++i) {
++        if (offset + 2 > size)
++            return false;
++        size_t nal_size = (data[offset] << 8) | data[offset + 1];
++        offset += 2;
++        if (!nal_size || offset + nal_size > size)
++            return false;
++        append_start_code_nal(output, data + offset, nal_size);
++        offset += nal_size;
++    }
++
++    if (offset >= size)
++        return false;
++    unsigned int pps_count = data[offset++];
++    for (unsigned int i = 0; i < pps_count; ++i) {
++        if (offset + 2 > size)
++            return false;
++        size_t nal_size = (data[offset] << 8) | data[offset + 1];
++        offset += 2;
++        if (!nal_size || offset + nal_size > size)
++            return false;
++        append_start_code_nal(output, data + offset, nal_size);
++        offset += nal_size;
++    }
++    return !output.empty();
++}
++
++bool contains_nal_type(const std::vector<uint8_t>& stream, uint8_t type)
++{
++    for (size_t i = 0; i + 4 < stream.size(); ++i) {
++        size_t nal = 0;
++        if (stream[i] == 0 && stream[i + 1] == 0 && stream[i + 2] == 1)
++            nal = i + 3;
++        else if (i + 4 < stream.size() && stream[i] == 0 &&
++                 stream[i + 1] == 0 && stream[i + 2] == 0 &&
++                 stream[i + 3] == 1)
++            nal = i + 4;
++        if (nal && nal < stream.size() && (stream[nal] & 0x1f) == type)
++            return true;
++    }
++    return false;
++}
++
++} // namespace
++
++struct enc_h264::encoder_impl {
++    ComPtr<IMFTransform> transform;
++    std::vector<uint8_t> nv12;
++    std::vector<uint8_t> sequence_header;
++    std::vector<uint8_t> annex_b;
++    UINT32 width = 0;
++    UINT32 height = 0;
++    UINT32 fps = 30;
++    UINT32 bitrate = 4000000;
++    LONGLONG sample_time = 0;
++    bool mf_started = false;
++    bool com_started = false;
++    bool sent_parameter_sets = false;
++
++    encoder_impl(int bitrate_mbps, int requested_fps)
++    {
++        bitrate = static_cast<UINT32>(std::max(1, bitrate_mbps)) * 1000000U;
++        fps = static_cast<UINT32>(std::max(1, requested_fps));
++    }
++
++    ~encoder_impl()
++    {
++        shutdown();
++    }
++
++    void shutdown()
++    {
++        if (transform) {
++            transform->ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0);
++            transform->ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0);
++            transform.Reset();
++        }
++        if (mf_started) {
++            MFShutdown();
++            mf_started = false;
++        }
++        if (com_started) {
++            CoUninitialize();
++            com_started = false;
++        }
++        width = height = 0;
++        sample_time = 0;
++        sent_parameter_sets = false;
++        sequence_header.clear();
++    }
++
++    HRESULT set_codec_u32(const GUID& key, UINT32 value)
++    {
++        ComPtr<ICodecAPI> codec;
++        HRESULT hr = transform.As(&codec);
++        if (FAILED(hr))
++            return hr;
++        VARIANT setting;
++        VariantInit(&setting);
++        setting.vt = VT_UI4;
++        setting.ulVal = value;
++        return codec->SetValue(&key, &setting);
++    }
++
++    HRESULT initialize(UINT32 new_width, UINT32 new_height)
++    {
++        shutdown();
++        if ((new_width & 1U) || (new_height & 1U))
++            return E_INVALIDARG;
++
++        HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
++        if (SUCCEEDED(hr))
++            com_started = true;
++        else if (hr != RPC_E_CHANGED_MODE)
++            return hr;
++
++        hr = MFStartup(MF_VERSION, MFSTARTUP_LITE);
++        if (FAILED(hr))
++            return hr;
++        mf_started = true;
++
++        hr = CoCreateInstance(CLSID_CMSH264EncoderMFT, nullptr,
++                              CLSCTX_INPROC_SERVER,
++                              IID_PPV_ARGS(&transform));
++        if (FAILED(hr))
++            return hr;
++
++        ComPtr<IMFMediaType> output_type;
++        hr = MFCreateMediaType(&output_type);
++        if (FAILED(hr)) return hr;
++        if (FAILED(hr = output_type->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video))) return hr;
++        if (FAILED(hr = output_type->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_H264))) return hr;
++        if (FAILED(hr = output_type->SetUINT32(MF_MT_AVG_BITRATE, bitrate))) return hr;
++        if (FAILED(hr = output_type->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive))) return hr;
++        if (FAILED(hr = output_type->SetUINT32(MF_MT_MPEG2_PROFILE, eAVEncH264VProfile_Main))) return hr;
++        if (FAILED(hr = MFSetAttributeSize(output_type.Get(), MF_MT_FRAME_SIZE, new_width, new_height))) return hr;
++        if (FAILED(hr = MFSetAttributeRatio(output_type.Get(), MF_MT_FRAME_RATE, fps, 1))) return hr;
++        if (FAILED(hr = MFSetAttributeRatio(output_type.Get(), MF_MT_PIXEL_ASPECT_RATIO, 1, 1))) return hr;
++        if (FAILED(hr = transform->SetOutputType(0, output_type.Get(), 0))) return hr;
++
++        ComPtr<IMFMediaType> input_type;
++        hr = MFCreateMediaType(&input_type);
++        if (FAILED(hr)) return hr;
++        if (FAILED(hr = input_type->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video))) return hr;
++        if (FAILED(hr = input_type->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_NV12))) return hr;
++        if (FAILED(hr = input_type->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive))) return hr;
++        if (FAILED(hr = MFSetAttributeSize(input_type.Get(), MF_MT_FRAME_SIZE, new_width, new_height))) return hr;
++        if (FAILED(hr = MFSetAttributeRatio(input_type.Get(), MF_MT_FRAME_RATE, fps, 1))) return hr;
++        if (FAILED(hr = MFSetAttributeRatio(input_type.Get(), MF_MT_PIXEL_ASPECT_RATIO, 1, 1))) return hr;
++        if (FAILED(hr = transform->SetInputType(0, input_type.Get(), 0))) return hr;
++
++        set_codec_u32(CODECAPI_AVEncCommonRateControlMode,
++                      eAVEncCommonRateControlMode_LowDelayVBR);
++        set_codec_u32(CODECAPI_AVEncCommonMeanBitRate, bitrate);
++        set_codec_u32(CODECAPI_AVEncMPVGOPSize, fps * 2);
++        set_codec_u32(CODECAPI_AVLowLatencyMode, TRUE);
++
++        if (FAILED(hr = transform->ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0))) return hr;
++        if (FAILED(hr = transform->ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0))) return hr;
++        if (FAILED(hr = transform->ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0))) return hr;
++
++        width = new_width;
++        height = new_height;
++        nv12.resize(static_cast<size_t>(width) * height * 3 / 2);
++        LOGI("H264 encoder ready: %ux%u %u fps %u bps\n",
++             width, height, fps, bitrate);
++        return S_OK;
++    }
++
++    void bgra_to_nv12(const uint8_t* bgra, UINT32 stride)
++    {
++        uint8_t* y_plane = nv12.data();
++        uint8_t* uv_plane = y_plane + static_cast<size_t>(width) * height;
++        for (UINT32 y = 0; y < height; ++y) {
++            const uint8_t* row = bgra + static_cast<size_t>(y) * stride;
++            for (UINT32 x = 0; x < width; ++x) {
++                int b = row[x * 4];
++                int g = row[x * 4 + 1];
++                int r = row[x * 4 + 2];
++                y_plane[static_cast<size_t>(y) * width + x] =
++                    clamp_byte(((66 * r + 129 * g + 25 * b + 128) >> 8) + 16);
++            }
++        }
++        for (UINT32 y = 0; y < height; y += 2) {
++            const uint8_t* row0 = bgra + static_cast<size_t>(y) * stride;
++            const uint8_t* row1 = bgra + static_cast<size_t>(y + 1) * stride;
++            for (UINT32 x = 0; x < width; x += 2) {
++                int b = row0[x * 4] + row0[(x + 1) * 4] +
++                        row1[x * 4] + row1[(x + 1) * 4];
++                int g = row0[x * 4 + 1] + row0[(x + 1) * 4 + 1] +
++                        row1[x * 4 + 1] + row1[(x + 1) * 4 + 1];
++                int r = row0[x * 4 + 2] + row0[(x + 1) * 4 + 2] +
++                        row1[x * 4 + 2] + row1[(x + 1) * 4 + 2];
++                r >>= 2; g >>= 2; b >>= 2;
++                size_t uv = static_cast<size_t>(y / 2) * width + x;
++                uv_plane[uv] = clamp_byte(((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128);
++                uv_plane[uv + 1] = clamp_byte(((112 * r - 94 * g - 18 * b + 128) >> 8) + 128);
++            }
++        }
++    }
++
++    void update_sequence_header()
++    {
++        ComPtr<IMFMediaType> type;
++        if (FAILED(transform->GetOutputCurrentType(0, &type)))
++            return;
++        UINT32 size = 0;
++        if (FAILED(type->GetBlobSize(MF_MT_MPEG_SEQUENCE_HEADER, &size)) || !size)
++            return;
++        std::vector<uint8_t> config(size);
++        if (FAILED(type->GetBlob(MF_MT_MPEG_SEQUENCE_HEADER, config.data(),
++                                 size, &size)))
++            return;
++        decoder_config_to_annex_b(config.data(), size, sequence_header);
++    }
++
++    int encode(uint8_t* dst, const uint8_t* bgra, UINT32 source_stride,
++               int limit)
++    {
++        bgra_to_nv12(bgra, source_stride);
++
++        ComPtr<IMFMediaBuffer> input_buffer;
++        HRESULT hr = MFCreateMemoryBuffer(static_cast<DWORD>(nv12.size()),
++                                          &input_buffer);
++        if (FAILED(hr)) return -1;
++        BYTE* input = nullptr;
++        DWORD capacity = 0;
++        if (FAILED(hr = input_buffer->Lock(&input, &capacity, nullptr))) return -1;
++        memcpy(input, nv12.data(), nv12.size());
++        input_buffer->Unlock();
++        input_buffer->SetCurrentLength(static_cast<DWORD>(nv12.size()));
++
++        ComPtr<IMFSample> input_sample;
++        if (FAILED(hr = MFCreateSample(&input_sample))) return -1;
++        if (FAILED(hr = input_sample->AddBuffer(input_buffer.Get()))) return -1;
++        LONGLONG duration = 10000000LL / fps;
++        input_sample->SetSampleTime(sample_time);
++        input_sample->SetSampleDuration(duration);
++        sample_time += duration;
++        if (FAILED(hr = transform->ProcessInput(0, input_sample.Get(), 0))) {
++            LOGE("H264 ProcessInput failed: 0x%08x\n", hr);
++            return -1;
++        }
++
++        MFT_OUTPUT_STREAM_INFO info = {};
++        if (FAILED(hr = transform->GetOutputStreamInfo(0, &info))) return -1;
++        MFT_OUTPUT_DATA_BUFFER output = {};
++        ComPtr<IMFSample> output_sample;
++        if (!(info.dwFlags & MFT_OUTPUT_STREAM_PROVIDES_SAMPLES)) {
++            ComPtr<IMFMediaBuffer> output_buffer;
++            DWORD buffer_size = static_cast<DWORD>(std::max<int>(limit, info.cbSize));
++            if (FAILED(hr = MFCreateMemoryBuffer(buffer_size, &output_buffer))) return -1;
++            if (FAILED(hr = MFCreateSample(&output_sample))) return -1;
++            if (FAILED(hr = output_sample->AddBuffer(output_buffer.Get()))) return -1;
++            output.pSample = output_sample.Get();
++        }
++
++        DWORD status = 0;
++        hr = transform->ProcessOutput(0, 1, &output, &status);
++        if (hr == MF_E_TRANSFORM_NEED_MORE_INPUT)
++            return 0;
++        if (hr == MF_E_TRANSFORM_STREAM_CHANGE) {
++            LOGW("H264 encoder requested an output stream change\n");
++            return 0;
++        }
++        if (FAILED(hr)) {
++            LOGE("H264 ProcessOutput failed: 0x%08x\n", hr);
++            return -1;
++        }
++
++        IMFSample* produced = output.pSample;
++        if (!produced)
++            return 0;
++        ComPtr<IMFMediaBuffer> contiguous;
++        if (FAILED(hr = produced->ConvertToContiguousBuffer(&contiguous))) return -1;
++        BYTE* encoded = nullptr;
++        DWORD encoded_size = 0;
++        if (FAILED(hr = contiguous->Lock(&encoded, nullptr, &encoded_size))) return -1;
++
++        if (has_start_code(encoded, encoded_size))
++            annex_b.assign(encoded, encoded + encoded_size);
++        else if (!avcc_to_annex_b(encoded, encoded_size, annex_b)) {
++            contiguous->Unlock();
++            LOGE("H264 output is neither Annex-B nor 4-byte AVCC\n");
++            return -1;
++        }
++        contiguous->Unlock();
++
++        if (sequence_header.empty())
++            update_sequence_header();
++        bool idr = contains_nal_type(annex_b, 5);
++        bool has_sps = contains_nal_type(annex_b, 7);
++        size_t prefix = ((!sent_parameter_sets || idr) && !has_sps) ?
++                        sequence_header.size() : 0;
++        if (prefix + annex_b.size() > static_cast<size_t>(limit)) {
++            LOGE("H264 access unit too large: %zu > %d\n",
++                 prefix + annex_b.size(), limit);
++            return -1;
++        }
++        if (prefix)
++            memcpy(dst, sequence_header.data(), prefix);
++        memcpy(dst + prefix, annex_b.data(), annex_b.size());
++        if (has_sps || prefix)
++            sent_parameter_sets = true;
++        return static_cast<int>(prefix + annex_b.size());
++    }
++};
++
++enc_h264::enc_h264(int bitrate_mbps, int fps)
++    : impl_(new encoder_impl(bitrate_mbps, fps))
++{
++    enc_type = UDISP_TYPE_H264;
++}
++
++enc_h264::~enc_h264()
++{
++    delete impl_;
++}
++
++int enc_h264::enc(uint8_t* dst, uint8_t* src, int x, int y, int right,
++                  int bottom, int line_width, int limit)
++{
++    if (x || y)
++        return -1;
++    UINT32 width = static_cast<UINT32>(right + 1);
++    UINT32 height = static_cast<UINT32>(bottom + 1);
++    if (impl_->width != width || impl_->height != height) {
++        HRESULT hr = impl_->initialize(width, height);
++        if (FAILED(hr)) {
++            LOGE("H264 encoder initialization failed: 0x%08x\n", hr);
++            return -1;
++        }
++    }
++    return impl_->encode(dst, src, static_cast<UINT32>(line_width) * 4U,
++                         limit);
++}
+diff --git a/win10_idd_xfz1986_usb_graphic_driver/idd_xfz1986_usb_graphic/enc_h264.h b/win10_idd_xfz1986_usb_graphic_driver/idd_xfz1986_usb_graphic/enc_h264.h
+new file mode 100644
+index 0000000..797e825
+--- /dev/null
++++ b/win10_idd_xfz1986_usb_graphic_driver/idd_xfz1986_usb_graphic/enc_h264.h
+@@ -0,0 +1,16 @@
++#pragma once
++
++#include "enc_base.h"
++
++class enc_h264 : public enc_base {
++public:
++    enc_h264(int bitrate_mbps, int fps);
++    ~enc_h264() override;
++
++    int enc(uint8_t* dst, uint8_t* src, int x, int y, int right,
++            int bottom, int line_width, int limit) override;
++
++private:
++    struct encoder_impl;
++    encoder_impl* impl_;
++};
+diff --git a/win10_idd_xfz1986_usb_graphic_driver/idd_xfz1986_usb_graphic/idd_xfz1986_usb_graphic.vcxproj b/win10_idd_xfz1986_usb_graphic_driver/idd_xfz1986_usb_graphic/idd_xfz1986_usb_graphic.vcxproj
+old mode 100755
+new mode 100644
+index c93610c..fbd016c
+--- a/win10_idd_xfz1986_usb_graphic_driver/idd_xfz1986_usb_graphic/idd_xfz1986_usb_graphic.vcxproj
++++ b/win10_idd_xfz1986_usb_graphic_driver/idd_xfz1986_usb_graphic/idd_xfz1986_usb_graphic.vcxproj
+@@ -39,8 +39,8 @@
+   </ItemGroup>
+   <ItemGroup>
+     <Inf Include="xfz1986_usb_graphic.inf">
+-      <TimeStamp Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">1.2.25.2</TimeStamp>
+-      <TimeStamp Condition="'$(Configuration)|$(Platform)'=='Release|x64'">1.2.25.2</TimeStamp>
++      <TimeStamp Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">1.3.0.0</TimeStamp>
++      <TimeStamp Condition="'$(Configuration)|$(Platform)'=='Release|x64'">1.3.0.0</TimeStamp>
+     </Inf>
+   </ItemGroup>
+   <PropertyGroup Label="Globals">
+@@ -51,9 +51,17 @@
+     <Configuration>Debug</Configuration>
+     <Platform Condition="'$(Platform)' == ''">Win32</Platform>
+     <RootNamespace>idd_xfz1986_usb_graphic</RootNamespace>
+-    <ProjectName>xfz1986_usb_graphic</ProjectName>
+-    <WindowsTargetPlatformVersion>10.0.19041.0</WindowsTargetPlatformVersion>
+-  </PropertyGroup>
++    <ProjectName>xfz1986_usb_graphic</ProjectName>
++    <WindowsTargetPlatformVersion>10.0.28000.0</WindowsTargetPlatformVersion>
++    <WDKNuGetRoot>$(UserProfile)\.nuget\packages\microsoft.windows.wdk.x64\10.0.28000.2526\c\</WDKNuGetRoot>
++    <WindowsSdkDir>$(WDKNuGetRoot)</WindowsSdkDir>
++    <WDKContentRoot>$(WDKNuGetRoot)</WDKContentRoot>
++    <InfToolPath>$(WDKNuGetRoot)bin\10.0.28000.0\x64\</InfToolPath>
++    <DrvCatToolPath>$(WDKNuGetRoot)bin\10.0.28000.0\x64\</DrvCatToolPath>
++    <SkipPackageVerification>true</SkipPackageVerification>
++    <ApiValidator_Enable>false</ApiValidator_Enable>
++    <SignMode>Off</SignMode>
++  </PropertyGroup>
+   <PropertyGroup Label="PropertySheets" Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
+     <PlatformToolset>WindowsUserModeDriver10.0</PlatformToolset>
+     <ConfigurationType>DynamicLibrary</ConfigurationType>
+@@ -233,22 +241,22 @@
+       <WppRecorderEnabled>true</WppRecorderEnabled>
+       <WppScanConfigurationData Condition="'%(ClCompile.ScanConfigurationData)' == ''">trace.h</WppScanConfigurationData>
+       <ExceptionHandling>Async</ExceptionHandling>
+-      <EnablePREfast>true</EnablePREfast>
++      <EnablePREfast>false</EnablePREfast>
+       <PreprocessorDefinitions>_WIN64;_AMD64_;AMD64;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+       <AdditionalOptions>/D_ATL_NO_WIN_SUPPORT /DUMDF_DRIVER /DIDDCX_VERSION_MAJOR=1 /DIDDCX_VERSION_MINOR=6 /DIDDCX_MINIMUM_VERSION_REQUIRED=4 %(AdditionalOptions)</AdditionalOptions>
+       <TreatWarningAsError>false</TreatWarningAsError>
+     </ClCompile>
+     <Link>
+-      <AdditionalDependencies>%(AdditionalDependencies);OneCoreUAP.lib;avrt.lib;jpeg-static.lib</AdditionalDependencies>
++      <AdditionalDependencies>%(AdditionalDependencies);OneCoreUAP.lib;avrt.lib;jpeg-static.lib;mfplat.lib;mfuuid.lib;mf.lib;wmcodecdspuuid.lib</AdditionalDependencies>
+     </Link>
+     <DriverSign>
+       <FileDigestAlgorithm>SHA256</FileDigestAlgorithm>
+     </DriverSign>
+     <Inf>
+-      <TimeStamp>1.2.25.2</TimeStamp>
++      <TimeStamp>1.3.0.0</TimeStamp>
+     </Inf>
+   </ItemDefinitionGroup>
+-  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
++  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+     <ClCompile>
+       <WppEnabled>true</WppEnabled>
+       <WppRecorderEnabled>true</WppRecorderEnabled>
+@@ -256,12 +264,12 @@
+       <FavorSizeOrSpeed>Speed</FavorSizeOrSpeed>
+       <TreatWarningAsError>false</TreatWarningAsError>
+       <ExceptionHandling>Async</ExceptionHandling>
+-      <EnablePREfast>true</EnablePREfast>
++      <EnablePREfast>false</EnablePREfast>
+       <PreprocessorDefinitions>_WIN64;_AMD64_;AMD64;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+       <AdditionalOptions>/D_ATL_NO_WIN_SUPPORT /DUMDF_DRIVER /DIDDCX_VERSION_MAJOR=1 /DIDDCX_VERSION_MINOR=6 /DIDDCX_MINIMUM_VERSION_REQUIRED=4 %(AdditionalOptions)</AdditionalOptions>
+     </ClCompile>
+     <Link>
+-      <AdditionalDependencies>%(AdditionalDependencies);OneCoreUAP.lib;avrt.lib;jpeg-static.lib</AdditionalDependencies>
++      <AdditionalDependencies>%(AdditionalDependencies);OneCoreUAP.lib;avrt.lib;jpeg-static.lib;mfplat.lib;mfuuid.lib;mf.lib;wmcodecdspuuid.lib</AdditionalDependencies>
+     </Link>
+     <DriverSign>
+       <FileDigestAlgorithm>SHA256</FileDigestAlgorithm>
+@@ -269,7 +277,7 @@
+     <Inf>
+       <DriverVersionSectionName>
+       </DriverVersionSectionName>
+-      <TimeStamp>1.2.25.2</TimeStamp>
++      <TimeStamp>1.3.0.0</TimeStamp>
+     </Inf>
+   </ItemDefinitionGroup>
+   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|ARM'">
+@@ -325,7 +333,8 @@
+     <ClInclude Include="base_type.h" />
+     <ClInclude Include="Driver.h" />
+     <ClInclude Include="enc_base.h" />
+-    <ClInclude Include="enc_jpg.h" />
++    <ClInclude Include="enc_jpg.h" />
++    <ClInclude Include="enc_h264.h" />
+     <ClInclude Include="log.h" />
+     <ClInclude Include="resource.h" />
+     <ClInclude Include="tiny_jpeg.h" />
+@@ -334,14 +343,18 @@
+   <ItemGroup>
+     <ClCompile Include="Driver.cpp" />
+     <ClCompile Include="enc_base.cpp" />
+-    <ClCompile Include="enc_jpg.cpp" />
++    <ClCompile Include="enc_jpg.cpp" />
++    <ClCompile Include="enc_h264.cpp" />
+     <ClCompile Include="enc_raw_rgb.cpp" />
+     <ClCompile Include="tiny_jpeg.c" />
+   </ItemGroup>
+-  <ItemGroup>
+-    <ResourceCompile Include="Resource.rc" />
+-  </ItemGroup>
+-  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
++  <ItemGroup>
++    <ResourceCompile Include="Resource.rc" />
++  </ItemGroup>
++  <ItemGroup>
++    <PackageReference Include="Microsoft.Windows.WDK.x64" Version="10.0.28000.2526" />
++  </ItemGroup>
++  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+   <ImportGroup Label="ExtensionTargets">
+   </ImportGroup>
+ </Project>
+diff --git a/win10_idd_xfz1986_usb_graphic_driver/idd_xfz1986_usb_graphic/idd_xfz1986_usb_graphic.vcxproj.filters b/win10_idd_xfz1986_usb_graphic_driver/idd_xfz1986_usb_graphic/idd_xfz1986_usb_graphic.vcxproj.filters
+old mode 100755
+new mode 100644
+index 84eb760..9cb2fc7
+--- a/win10_idd_xfz1986_usb_graphic_driver/idd_xfz1986_usb_graphic/idd_xfz1986_usb_graphic.vcxproj.filters
++++ b/win10_idd_xfz1986_usb_graphic_driver/idd_xfz1986_usb_graphic/idd_xfz1986_usb_graphic.vcxproj.filters
+@@ -40,9 +40,12 @@
+     <ClInclude Include="base_type.h">
+       <Filter>Header Files</Filter>
+     </ClInclude>
+-    <ClInclude Include="enc_jpg.h">
+-      <Filter>Header Files</Filter>
+-    </ClInclude>
++    <ClInclude Include="enc_jpg.h">
++      <Filter>Header Files</Filter>
++    </ClInclude>
++    <ClInclude Include="enc_h264.h">
++      <Filter>Header Files</Filter>
++    </ClInclude>
+     <ClInclude Include="resource.h">
+       <Filter>Header Files</Filter>
+     </ClInclude>
+@@ -60,9 +63,12 @@
+     <ClCompile Include="enc_raw_rgb.cpp">
+       <Filter>Source Files</Filter>
+     </ClCompile>
+-    <ClCompile Include="enc_jpg.cpp">
+-      <Filter>Source Files</Filter>
+-    </ClCompile>
++    <ClCompile Include="enc_jpg.cpp">
++      <Filter>Source Files</Filter>
++    </ClCompile>
++    <ClCompile Include="enc_h264.cpp">
++      <Filter>Source Files</Filter>
++    </ClCompile>
+   </ItemGroup>
+   <ItemGroup>
+     <Inf Include="xfz1986_usb_graphic.inf">
+@@ -74,4 +80,4 @@
+       <Filter>Resource Files</Filter>
+     </ResourceCompile>
+   </ItemGroup>
+-</Project>
+\ No newline at end of file
++</Project>
+diff --git a/win10_idd_xfz1986_usb_graphic_driver/idd_xfz1986_usb_graphic/xfz1986_usb_graphic.inf b/win10_idd_xfz1986_usb_graphic_driver/idd_xfz1986_usb_graphic/xfz1986_usb_graphic.inf
+old mode 100755
+new mode 100644
+index 0610f2b213f50ef5732fdc5b1ad9ccc04a41eb6a..9e7490f26067073d76419eeaa27a59f3bb9867c2
+GIT binary patch
+delta 162
+zcmaE&cuanSAG5eIgENCMgBn8sgC~OvLp*~4gDVi5PCm;lzqyO~4X3apLlHv>P%;mw
+zFoPkJp@2bY@=soAO-ykGhERrJ1}6puph1}o#Xyxg42cYtldbvGCvV_8rcJaCpbdZd
+Gp926<(<8(H
+
+delta 399
+zcmX>m|3q<vAG5RpgE506gBn8sgC~OvLp*~KgC&CngBgPYgZ1R2%!->^nBQ<FCITf=
+z7%~|u8B!UFfb2YmM21`-JD#C}A&sGm!4RrR38W2(Lm2#lhWRsC0og%7bp;GLKpn|I
+zmI6aL(3}#63?QqLA)lcXXr2N??qpwHacu>-xx5TqK>e8v#SGaDeo(s<7;J$mm4Kot
+z3@H;8rP)(}#^o~PPd?78?oW!fDL^YT8OngVK~{sj1+oUk^2v<c%9Dlo7EPYSsg|e#
+pR0Fn&K@(^_DK;eoJy-;UsX(unfbB{J+M5Xt2v{KUPQK6g8~{x$N`n9Z
+
